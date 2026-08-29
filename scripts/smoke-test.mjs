@@ -15,8 +15,11 @@ function check(name, ok, detail = '') {
 /** Everything currently rendered in the xterm buffer, as plain text. */
 async function screenText(page) {
   return page.evaluate(() => {
+    const NBSP = String.fromCharCode(160);
     const rows = document.querySelectorAll('.xterm-rows > div');
-    return Array.from(rows).map((r) => r.textContent.replace(/ /g, ' ').trimEnd()).join('\n');
+    return Array.from(rows)
+      .map((r) => r.textContent.split(NBSP).join(' ').replace(/\s+$/, ''))
+      .join('\n');
   });
 }
 
@@ -29,10 +32,16 @@ async function waitForText(page, needle, timeout = 90000) {
   return false;
 }
 
+// Set the document directly; typing Python in char-by-char would fight with
+// auto-indent and bracket closing.
 async function setCode(page, code) {
-  // Set the document directly; typing Python in char-by-char would fight with
-  // auto-indent and bracket closing.
   await page.evaluate((src) => window.pyweb.editor.setCode(src), code);
+}
+
+async function typeLine(page, text) {
+  await page.click('.xterm-screen');
+  await page.keyboard.type(text);
+  await page.keyboard.press('Enter');
 }
 
 const browser = await chromium.launch({ headless: !HEADED });
@@ -47,8 +56,7 @@ try {
   check('page loads', true);
   check('cross-origin isolated', await page.evaluate(() => window.crossOriginIsolated === true));
   check('SharedArrayBuffer available', await page.evaluate(() => typeof SharedArrayBuffer !== 'undefined'));
-
-  check('Pyodide boots', await waitForText(page, 'Python ready'), 'waited for banner');
+  check('Pyodide boots', await waitForText(page, 'Python ready'));
 
   // --- 1. print + a while loop -------------------------------------------
   await setCode(page, [
@@ -61,7 +69,8 @@ try {
     'print("total is", total)',
   ].join('\n'));
   await page.click('#run');
-  check('while loop runs', await waitForText(page, 'total is 15'), 'expected total is 15');
+  check('while loop runs', await waitForText(page, 'total is 15'));
+  check('loop printed every iteration', (await screenText(page)).includes('step 5'));
 
   // --- 2. blocking input() inline in the same terminal --------------------
   await setCode(page, [
@@ -71,40 +80,36 @@ try {
   ].join('\n'));
   await page.click('#run');
 
-  check('prompt is printed before input', await waitForText(page, 'Name: ', 30000));
-  await page.click('.xterm-screen');
-  await page.keyboard.type('Ada');
-  await page.keyboard.press('Enter');
-
-  check('second prompt appears', await waitForText(page, 'Age: ', 30000));
-  await page.keyboard.type('35');
-  await page.keyboard.press('Enter');
-
+  check('prompt prints before input', await waitForText(page, 'Name:', 30000));
+  await typeLine(page, 'Ada');
+  check('second prompt appears', await waitForText(page, 'Age:', 30000));
+  await typeLine(page, '35');
   check('input() returns typed text', await waitForText(page, 'Hello Ada, next year you are 36', 30000));
 
   const echoed = await screenText(page);
-  check('typed text echoes on the prompt line', /Name: Ada/.test(echoed), echoed.split('\n').find((l) => l.includes('Name:')) ?? '');
+  check(
+    'typing echoes on the prompt line',
+    /Name: Ada/.test(echoed),
+    echoed.split('\n').find((l) => l.includes('Name:')) ?? '',
+  );
+  check('run completes', await waitForText(page, 'finished', 20000));
 
   // --- 3. input() inside a while loop (the chatbot shape) -----------------
   await setCode(page, [
     'while True:',
-    '    msg = input("> ")',
+    '    msg = input("say: ")',
     '    if msg == "bye":',
     '        print("done after loop")',
     '        break',
     '    print("echo:", msg.upper())',
   ].join('\n'));
   await page.click('#run');
-  await waitForText(page, '> ', 30000);
-  await page.click('.xterm-screen');
-  await page.keyboard.type('hello');
-  await page.keyboard.press('Enter');
+  await waitForText(page, 'say:', 30000);
+  await typeLine(page, 'hello');
   check('loop input round 1', await waitForText(page, 'echo: HELLO', 20000));
-  await page.keyboard.type('again');
-  await page.keyboard.press('Enter');
+  await typeLine(page, 'again');
   check('loop input round 2', await waitForText(page, 'echo: AGAIN', 20000));
-  await page.keyboard.type('bye');
-  await page.keyboard.press('Enter');
+  await typeLine(page, 'bye');
   check('loop exits on break', await waitForText(page, 'done after loop', 20000));
 
   // --- 4. tracebacks ------------------------------------------------------
@@ -112,7 +117,7 @@ try {
   await page.click('#run');
   check('traceback reported', await waitForText(page, 'ZeroDivisionError', 20000));
   const tb = await screenText(page);
-  check('traceback names main.py', tb.includes('main.py'), 'file label rewritten');
+  check('traceback names main.py', tb.includes('main.py'));
   check('traceback hides pyodide internals', !tb.includes('_pyodide'));
 
   // --- 5. stopping an infinite loop ---------------------------------------
@@ -122,20 +127,33 @@ try {
   await page.click('#stop');
   check('infinite loop interruptible', await waitForText(page, 'KeyboardInterrupt', 20000));
 
-  // --- 6. interpreter survives and stays usable ---------------------------
+  // --- 6. interrupting a program parked on input() ------------------------
+  await setCode(page, 'x = input("blocked: ")');
+  await page.click('#run');
+  await waitForText(page, 'blocked:', 20000);
+  await page.click('#stop');
+  check('interruptible while waiting on input', await waitForText(page, 'stopped', 20000));
+
+  // --- 7. interpreter survives and stays usable ---------------------------
   await setCode(page, 'print("still alive:", sum(range(10)))');
   await page.click('#run');
   check('runs again after interrupt', await waitForText(page, 'still alive: 45', 30000));
 
-  // --- 7. stdlib imports --------------------------------------------------
+  // --- 8. stdlib imports --------------------------------------------------
   await setCode(page, [
     'import math, random, json, datetime',
     'random.seed(1)',
     'print(json.dumps({"sqrt": round(math.sqrt(2), 4)}))',
-    'print("ok", isinstance(datetime.date.today(), datetime.date))',
+    'print("date ok:", isinstance(datetime.date.today(), datetime.date))',
   ].join('\n'));
   await page.click('#run');
   check('stdlib imports work', await waitForText(page, '"sqrt": 1.4142', 30000));
+  check('datetime works', (await screenText(page)).includes('date ok: True'));
+
+  // --- 9. state does not leak between runs --------------------------------
+  await setCode(page, 'print("leaked" if "name" in dir() else "clean namespace")');
+  await page.click('#run');
+  check('fresh namespace each run', await waitForText(page, 'clean namespace', 20000));
 
   check('no uncaught page errors', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
 } catch (err) {

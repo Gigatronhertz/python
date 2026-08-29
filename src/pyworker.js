@@ -76,7 +76,9 @@ async function init(buffers) {
     stdin: readStdin,
   });
 
-  pyodide.setStdin({ stdin: readStdin, isatty: true, autoEOF: false });
+  // autoEOF terminates each returned line, which is what lets a tty read()
+  // complete; without it CPython keeps asking for more characters forever.
+  pyodide.setStdin({ stdin: readStdin, isatty: true, autoEOF: true });
   pyodide.setStdout(makeWriter('stdout'));
   pyodide.setStderr(makeWriter('stderr'));
   if (interrupt) pyodide.setInterruptBuffer(interrupt);
