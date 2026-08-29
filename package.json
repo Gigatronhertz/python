@@ -1,0 +1,32 @@
+{
+  "name": "pyweb-interpreter",
+  "version": "1.0.0",
+  "description": "A full Python interpreter that runs entirely in the browser.",
+  "scripts": {
+    "dev": "node scripts/copy-pyodide.mjs && vite",
+    "build": "node scripts/copy-pyodide.mjs && vite build",
+    "preview": "vite preview",
+    "postinstall": "node scripts/copy-pyodide.mjs"
+  },
+  "type": "module",
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
+    "@codemirror/commands": "^6.11.0",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.9",
+    "@lezer/highlight": "^1.2.3",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "codemirror": "^6.0.2",
+    "pyodide": "^314.0.6"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1",
+    "vite": "^8.2.2"
+  },
+  "private": true
+}
