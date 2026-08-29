@@ -155,6 +155,58 @@ try {
   await page.click('#run');
   check('fresh namespace each run', await waitForText(page, 'clean namespace', 20000));
 
+  // --- 10. editor: auto-indent -------------------------------------------
+  await setCode(page, '');
+  await page.click('.cm-content');
+  await page.keyboard.type('for i in range(3):');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('print(i)');
+  const indented = await page.evaluate(() => window.pyweb.editor.getCode());
+  check('auto-indents after a colon', /\n {4}print\(i\)/.test(indented), JSON.stringify(indented));
+
+  // "(" auto-closes and the typed ")" types over it, rather than doubling up.
+  check(
+    'closes brackets without doubling',
+    indented.includes('print(i)') && !indented.includes('))'),
+    JSON.stringify(indented),
+  );
+
+  // --- 11. editor: autocomplete -------------------------------------------
+  await setCode(page, '');
+  await page.click('.cm-content');
+  await page.keyboard.type('ran');
+  await page.waitForTimeout(600);
+  const popupOpen = await page.locator('.cm-tooltip-autocomplete').isVisible().catch(() => false);
+  check('autocomplete popup opens while typing', popupOpen);
+
+  const optionText = popupOpen
+    ? await page.locator('.cm-tooltip-autocomplete li').allTextContents()
+    : [];
+  check('suggests matching names', optionText.some((t) => t.includes('random')), optionText.slice(0, 5).join(', '));
+
+  if (popupOpen) {
+    await page.keyboard.press('Tab');
+    const completed = await page.evaluate(() => window.pyweb.editor.getCode());
+    // Whichever candidate ranked first, Tab should have finished the word
+    // rather than inserting a tab character.
+    check(
+      'Tab accepts the completion',
+      /^ran\w+$/.test(completed),
+      JSON.stringify(completed),
+    );
+  } else {
+    check('Tab accepts the completion', false, 'popup never opened');
+  }
+
+  // Member completion after a dot.
+  await setCode(page, 'name = "ada"\nname.');
+  await page.click('.cm-content');
+  await page.keyboard.press('Control+End');
+  await page.keyboard.type('up');
+  await page.waitForTimeout(600);
+  const members = await page.locator('.cm-tooltip-autocomplete li').allTextContents().catch(() => []);
+  check('suggests methods after a dot', members.some((t) => t.includes('upper')), members.slice(0, 5).join(', '));
+
   check('no uncaught page errors', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
 } catch (err) {
   check('harness completed', false, String(err && err.message));

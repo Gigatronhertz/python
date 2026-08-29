@@ -26,6 +26,11 @@ function readStdin() {
         'Reload the page, or open it over https.',
     );
   }
+  // Once interrupted, keep answering EOF locally. CPython's readline retries
+  // the read while a signal is pending, and each retry would otherwise park us
+  // on a fresh prompt the user never asked for.
+  if (interruptedAtPrompt) return null;
+
   Atomics.store(ctrl, IDX_STATE, STATE_WAITING);
   post({ type: 'stdin-request' });
   Atomics.wait(ctrl, IDX_STATE, STATE_WAITING);
@@ -34,7 +39,11 @@ function readStdin() {
   if (state === STATE_INTERRUPT) {
     interruptedAtPrompt = true;
     if (interrupt) interrupt[0] = SIGINT;
-    return null; // unblocks CPython; the pending SIGINT raises KeyboardInterrupt
+    // Raise KeyboardInterrupt from inside the read itself. Returning EOF here
+    // instead would surface as EOFError, with the signal landing later —
+    // usually midway through printing that unwanted traceback.
+    pyodide.checkInterrupt();
+    return null; // unreachable unless the signal was already consumed
   }
   if (state === STATE_EOF) return null;
 
@@ -63,6 +72,53 @@ function makeWriter(stream) {
   };
 }
 
+/**
+ * User code runs inside this Python driver rather than through runPythonAsync
+ * directly, for two reasons:
+ *
+ *  - KeyboardInterrupt is a BaseException, so it slips past Pyodide's event
+ *    loop without ever settling the promise JS is awaiting. Catching it in
+ *    Python keeps every outcome on one path.
+ *  - Compiling with filename "main.py" and dropping this frame from the
+ *    traceback makes errors read exactly like `python main.py` would.
+ */
+const DRIVER = `
+import ast, inspect, sys, traceback
+
+sys.argv = ["main.py"]
+sys.setrecursionlimit(2000)
+
+
+async def __pyweb_run(src):
+    ns = {"__name__": "__main__", "__doc__": None, "__package__": None}
+    try:
+        code = compile(src, "main.py", "exec",
+                       flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        result = eval(code, ns)
+        if inspect.isawaitable(result):
+            await result
+    except SystemExit:
+        return "ok"
+    except KeyboardInterrupt:
+        print("\\nKeyboardInterrupt", file=sys.stderr)
+        return "interrupted"
+    except BaseException as exc:
+        try:
+            tb = exc.__traceback__
+            # Skip this driver's own frame so only the user's program shows.
+            tb = tb.tb_next if tb is not None else None
+            traceback.print_exception(type(exc), exc, tb, file=sys.stderr)
+        except KeyboardInterrupt:
+            # Stop pressed while the traceback was still printing.
+            print("\\nKeyboardInterrupt", file=sys.stderr)
+            return "interrupted"
+        return "error"
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    return "ok"
+`;
+
 async function init(buffers) {
   ctrl = buffers.ctrl ?? null;
   data = buffers.data ?? null;
@@ -83,61 +139,25 @@ async function init(buffers) {
   pyodide.setStderr(makeWriter('stderr'));
   if (interrupt) pyodide.setInterruptBuffer(interrupt);
 
-  // Make the sandbox feel like a script run from a folder.
-  pyodide.runPython(`
-import sys
-sys.argv = ["main.py"]
-sys.setrecursionlimit(2000)
-`);
-
+  pyodide.runPython(DRIVER);
   post({ type: 'ready', version: pyodide.version });
-}
-
-/** Rewrite Pyodide's internal frames out of a traceback so it reads like CPython. */
-function cleanTraceback(text) {
-  const lines = String(text).split('\n');
-  const out = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Drop the Pyodide bootstrap frames the user never wrote.
-    if (/File "\/lib\/python\d+\.\d+\/(site-packages\/)?_pyodide\//.test(line)) {
-      i++; // also skip the source line that follows
-      continue;
-    }
-    if (/File "\/lib\/python\d+\.\d+\/asyncio\//.test(line)) {
-      i++;
-      continue;
-    }
-    out.push(line.replace(/File "<exec>"/g, 'File "main.py"'));
-  }
-  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 async function run(code) {
   interruptedAtPrompt = false;
   if (interrupt) interrupt[0] = 0;
 
-  // A fresh namespace per run, so one execution never leaks state into the next.
-  const globals = pyodide.runPython(
-    'dict(__name__="__main__", __doc__=None, __package__=None)',
-  );
+  const runner = pyodide.globals.get('__pyweb_run');
   try {
-    await pyodide.runPythonAsync(code, { globals, filename: '<exec>' });
-    post({ type: 'done', status: 'ok' });
+    // The driver reports its own outcome and prints its own traceback, so the
+    // only errors reaching this catch are interpreter-level failures.
+    const status = await runner(code);
+    post({ type: 'done', status: interruptedAtPrompt ? 'interrupted' : status });
   } catch (err) {
-    const isInterrupt =
-      interruptedAtPrompt ||
-      err?.type === 'KeyboardInterrupt' ||
-      /KeyboardInterrupt/.test(err?.message ?? '');
-    if (isInterrupt) {
-      post({ type: 'output', stream: 'stderr', text: '\nKeyboardInterrupt\n' });
-      post({ type: 'done', status: 'interrupted' });
-    } else {
-      post({ type: 'output', stream: 'stderr', text: cleanTraceback(err?.message ?? err) + '\n' });
-      post({ type: 'done', status: 'error' });
-    }
+    post({ type: 'output', stream: 'stderr', text: `${err?.message ?? err}\n` });
+    post({ type: 'done', status: 'error' });
   } finally {
-    globals.destroy();
+    runner.destroy();
     if (interrupt) interrupt[0] = 0;
   }
 }

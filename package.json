@@ -6,7 +6,8 @@
     "dev": "node scripts/copy-pyodide.mjs && vite",
     "build": "node scripts/copy-pyodide.mjs && vite build",
     "preview": "vite preview",
-    "postinstall": "node scripts/copy-pyodide.mjs"
+    "postinstall": "node scripts/copy-pyodide.mjs",
+    "test": "node scripts/smoke-test.mjs"
   },
   "type": "module",
   "dependencies": {

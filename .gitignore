@@ -1,0 +1,12 @@
+node_modules/
+dist/
+
+# Vendored at build time by scripts/copy-pyodide.mjs
+public/pyodide/
+
+.vercel/
+.DS_Store
+*.log
+
+# Scratch
+_debug.mjs
