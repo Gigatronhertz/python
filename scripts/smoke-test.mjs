@@ -1,6 +1,6 @@
 // End-to-end check of the parts that are hard to eyeball: cross-origin
 // isolation, Pyodide booting in the worker, blocking input(), while loops,
-// and interrupting a runaway program.
+// interrupting a runaway program, and pygame's window and input.
 import { chromium } from 'playwright';
 
 const URL = process.env.SMOKE_URL || 'http://localhost:4173/';
@@ -44,7 +44,10 @@ async function typeLine(page, text) {
   await page.keyboard.press('Enter');
 }
 
-const browser = await chromium.launch({ headless: !HEADED });
+const browser = await chromium.launch({
+  headless: !HEADED,
+  executablePath: process.env.CHROMIUM_PATH || undefined,
+});
 const page = await browser.newPage();
 const consoleErrors = [];
 page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
@@ -206,6 +209,62 @@ try {
   await page.waitForTimeout(600);
   const members = await page.locator('.cm-tooltip-autocomplete li').allTextContents().catch(() => []);
   check('suggests methods after a dot', members.some((t) => t.includes('upper')), members.slice(0, 5).join(', '));
+
+  // --- 12. pygame: window, frames, keyboard, mouse, Stop ------------------
+  await setCode(page, [
+    'import pygame',
+    'pygame.init()',
+    'screen = pygame.display.set_mode((200, 100))',
+    'x = 0',
+    'clock = pygame.time.Clock()',
+    'while True:',
+    '    for e in pygame.event.get():',
+    '        if e.type == pygame.MOUSEBUTTONDOWN:',
+    '            print("clicked at", e.pos, "button", e.button)',
+    '        if e.type == pygame.KEYDOWN and e.key == pygame.K_SPACE:',
+    '            print("space pressed")',
+    '    if pygame.key.get_pressed()[pygame.K_RIGHT]:',
+    '        x += 2',
+    '    screen.fill((0, 0, 0))',
+    '    pygame.draw.rect(screen, (255, 0, 0), (x, 40, 10, 10))',
+    '    pygame.display.flip()',
+    '    clock.tick(60)',
+  ].join('\n'));
+  await page.click('#run');
+  const opened = await page
+    .waitForSelector('#screen:not([hidden])', { timeout: 60000 })
+    .then(() => true, () => false);
+  check('pygame window opens', opened);
+
+  // Leftmost red pixel on the canvas, i.e. where the square is drawn.
+  const squareX = () => page.evaluate(() => {
+    const c = document.getElementById('canvas');
+    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i] === 255 && d[i + 1] === 0 && d[i + 2] === 0) return (i / 4) % c.width;
+    }
+    return -1;
+  });
+  await page.waitForTimeout(500);
+  check('pygame frames reach the canvas', (await squareX()) === 0);
+
+  await page.click('#canvas');
+  await page.keyboard.down('ArrowRight');
+  await page.waitForTimeout(500);
+  await page.keyboard.up('ArrowRight');
+  await page.waitForTimeout(200);
+  const moved = await squareX();
+  check('pygame.key.get_pressed sees held keys', moved > 10, `square at x=${moved}`);
+
+  await page.keyboard.press('Space');
+  check('pygame KEYDOWN events arrive', await waitForText(page, 'space pressed', 10000));
+
+  const box = await page.locator('#canvas').boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  check('pygame mouse clicks map to pixels', await waitForText(page, 'clicked at (100, 50) button 1', 10000));
+
+  await page.click('#stop');
+  check('pygame loop stops', await waitForText(page, 'stopped', 20000));
 
   check('no uncaught page errors', consoleErrors.length === 0, consoleErrors.slice(0, 3).join(' | '));
 } catch (err) {

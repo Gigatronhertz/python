@@ -46,6 +46,16 @@
       <div id="splitter" class="splitter" role="separator" aria-orientation="vertical"></div>
 
       <section class="pane terminal-pane">
+        <div id="screen" class="screen" hidden>
+          <div class="pane-head">
+            <span id="screen-title" class="pane-title">pygame window</span>
+            <span class="hint">Click the game to give it the keyboard</span>
+            <button id="screen-close" class="icon-btn" title="Close the window (sends pygame.QUIT)">✕</button>
+          </div>
+          <div class="screen-body">
+            <canvas id="canvas" tabindex="0" width="640" height="480"></canvas>
+          </div>
+        </div>
         <div class="pane-head">
           <span class="pane-title">Terminal</span>
           <span class="hint">input() is typed right here</span>

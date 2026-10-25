@@ -146,6 +146,64 @@ print("fib:", list(fib(100)))
 `,
   },
   {
+    id: 'pygame',
+    name: 'pygame: coin collector',
+    code: `# A pygame game. The window opens above the terminal.
+# Click it, then use the arrow keys (or WASD) to collect coins.
+# Close it with the ✕ button, Esc, or the Stop button.
+
+import random
+import pygame
+
+pygame.init()
+screen = pygame.display.set_mode((480, 360))
+pygame.display.set_caption("Coin collector")
+clock = pygame.time.Clock()
+font = pygame.font.Font(None, 32)
+
+player = pygame.Rect(220, 160, 32, 32)
+coin = pygame.Rect(0, 0, 16, 16)
+speed = 4
+score = 0
+
+
+def move_coin():
+    coin.topleft = (random.randint(0, 464), random.randint(40, 344))
+
+
+move_coin()
+running = True
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            running = False
+
+    keys = pygame.key.get_pressed()
+    dx = (keys[pygame.K_RIGHT] or keys[pygame.K_d]) - (keys[pygame.K_LEFT] or keys[pygame.K_a])
+    dy = (keys[pygame.K_DOWN] or keys[pygame.K_s]) - (keys[pygame.K_UP] or keys[pygame.K_w])
+    player.x += dx * speed
+    player.y += dy * speed
+    player.clamp_ip(screen.get_rect())
+
+    if player.colliderect(coin):
+        score += 1
+        print("Coin! Score:", score)
+        move_coin()
+
+    screen.fill((18, 24, 38))
+    pygame.draw.ellipse(screen, (247, 198, 107), coin)
+    pygame.draw.rect(screen, (93, 220, 154), player, border_radius=6)
+    screen.blit(font.render(f"Score: {score}", True, (214, 222, 235)), (10, 8))
+    pygame.display.flip()
+    clock.tick(60)
+
+pygame.quit()
+print("Thanks for playing! Final score:", score)
+`,
+  },
+  {
     id: 'countdown',
     name: 'Long loop (try the Stop button)',
     code: `import time

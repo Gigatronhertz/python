@@ -34,6 +34,9 @@ while True:
   highlighting, code folding, and `Tab`/`Shift+Tab` indentation.
 - **Clean tracebacks** that point at `main.py` and your line numbers, with none
   of the interpreter's own plumbing.
+- **pygame** (pygame-ce) — `import pygame` and the game window opens above
+  the terminal. Ordinary `while running:` game loops, keyboard, mouse and
+  `Clock.tick()` all work; click the game to give it the keyboard.
 - Your code is kept in `localStorage`, so a refresh does not lose it.
 
 ### Shortcuts
@@ -80,6 +83,25 @@ CPython itself between bytecodes. User code runs inside a small Python driver
 (`DRIVER` in `src/pyworker.js`) which catches `BaseException` — without it,
 `KeyboardInterrupt` slips past Pyodide's event loop and the run never settles.
 
+### pygame
+
+pygame-ce is loaded the first time a program imports it (about 1.5 MB, then
+cached). Its SDL video driver wants a DOM canvas, which the worker does not
+have, so `src/pygame_shim.py` swaps out four modules and leaves the rest of
+pygame alone:
+
+- `pygame.display`: the screen is an ordinary in-memory `Surface`. `flip()`
+  and `update()` send its pixels to the page, at most 60 times a second, and
+  the page paints them onto a `<canvas>`.
+- `pygame.event`, `pygame.key`, `pygame.mouse`: the page writes keyboard and
+  mouse events as JSON into a second `SharedArrayBuffer` mailbox, and the shim
+  turns them into real `pygame.event.Event`s. A game loop that never yields
+  still sees its input, just as `input()` does.
+
+Drawing, `Surface`, `Rect`, fonts, sprites, `transform`, `math` and `Clock`
+are the real pygame-ce. `Surface.convert()` / `convert_alpha()` return a copy,
+since there is no display format to convert to.
+
 ## Running locally
 
 ```bash
@@ -93,7 +115,8 @@ plain static file server will not, and `input()` will not work without them.
 ### Tests
 
 An end-to-end suite drives a real browser and checks the things that are easy to
-break: isolation headers, blocking input, loops, interrupts, tracebacks.
+break: isolation headers, blocking input, loops, interrupts, tracebacks,
+pygame frames and input.
 
 ```bash
 npm run build
@@ -119,18 +142,22 @@ those two headers on every response.
 | File | Role |
 | --- | --- |
 | `src/pyworker.js` | Pyodide, stdin/stdout wiring, the Python driver |
+| `src/pygame_shim.py` | pygame display, event, key and mouse for the worker |
 | `src/protocol.js` | SharedArrayBuffer layout shared by both threads |
 | `src/terminal.js` | xterm.js console and its line editor |
 | `src/editor.js` | CodeMirror 6: highlighting, indent, completion |
 | `src/completions.js` | Completion tables |
 | `src/main.js` | Wires it together: run, stop, stdin bridge, layout |
-| `scripts/copy-pyodide.mjs` | Vendors the Pyodide runtime into `public/` |
+| `scripts/copy-pyodide.mjs` | Vendors the Pyodide runtime and the pygame-ce wheel into `public/` |
 | `scripts/smoke-test.mjs` | Browser end-to-end suite |
 
 ## Limits
 
-- Third-party packages (numpy, pandas) are not bundled. The isolation headers
+- Third-party packages other than pygame (numpy, pandas) are not bundled. The isolation headers
   block loading them from a CDN at runtime; they would need vendoring too.
 - No filesystem persistence between runs — each run starts in a fresh
   namespace.
+- pygame has no sound (`pygame.mixer`), and there are no image or sound files
+  to load, so games draw with shapes and fonts. `pygame.time.set_timer` is
+  emulated in the shim; fullscreen and window resizing are not supported.
 - Needs a browser with `SharedArrayBuffer`: Chrome, Edge, Firefox, Safari 15.2+.

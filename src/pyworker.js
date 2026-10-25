@@ -4,12 +4,16 @@ import {
   STATE_WAITING, STATE_READY, STATE_EOF, STATE_INTERRUPT,
   SIGINT,
 } from './protocol.js';
+import PYGAME_SHIM from './pygame_shim.py?raw';
 
 let pyodide = null;
 let ctrl = null;
 let data = null;
 let interrupt = null;
 let interruptedAtPrompt = false;
+let eventLen = null;
+let eventData = null;
+let pygameReady = false;
 
 const decoder = new TextDecoder('utf-8');
 const post = (msg, transfer) => self.postMessage(msg, transfer || []);
@@ -73,6 +77,49 @@ function makeWriter(stream) {
 }
 
 /**
+ * The JS side of src/pygame_shim.py, importable from Python as
+ * `_pyweb_bridge`. Frames go out by postMessage; input comes in through the
+ * shared event mailbox, so a game loop that never yields still gets it.
+ */
+const pygameBridge = {
+  present(width, height, pixels) {
+    // `pixels` is a borrowed proxy of a Python bytes object; copy it out of
+    // the wasm heap before the call returns.
+    const view = pixels.getBuffer('u8');
+    const copy = new Uint8ClampedArray(view.data);
+    view.release();
+    post({ type: 'frame', width, height, pixels: copy }, [copy.buffer]);
+  },
+  take_events() {
+    if (!eventLen) return null;
+    const len = Atomics.load(eventLen, 0);
+    if (len === 0) return null;
+    const text = decoder.decode(eventData.slice(0, len));
+    Atomics.store(eventLen, 0, 0);
+    return text;
+  },
+  send(kind, json) {
+    post({ type: 'pygame', kind, ...JSON.parse(json) });
+  },
+};
+
+/** Load pygame-ce the first time a program imports it. */
+async function ensurePygame(code) {
+  if (pygameReady) return;
+  const imports = pyodide.pyimport('pyodide.code').find_imports(code);
+  const wanted = imports.toJs().includes('pygame');
+  imports.destroy();
+  if (!wanted) return;
+
+  post({ type: 'notice', text: 'Loading pygame…' });
+  await pyodide.loadPackage('pygame-ce', { messageCallback: () => {} });
+  pyodide.FS.mkdirTree('/pyweb');
+  pyodide.FS.writeFile('/pyweb/pyweb_pygame.py', PYGAME_SHIM);
+  pyodide.runPython('import sys; sys.path.append("/pyweb"); import pyweb_pygame');
+  pygameReady = true;
+}
+
+/**
  * User code runs inside this Python driver rather than through runPythonAsync
  * directly, for two reasons:
  *
@@ -91,6 +138,9 @@ sys.setrecursionlimit(2000)
 
 async def __pyweb_run(src):
     ns = {"__name__": "__main__", "__doc__": None, "__package__": None}
+    game = sys.modules.get("pyweb_pygame")
+    if game is not None:
+        game.reset()
     try:
         code = compile(src, "main.py", "exec",
                        flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
@@ -114,6 +164,11 @@ async def __pyweb_run(src):
             return "interrupted"
         return "error"
     finally:
+        if game is not None:
+            try:
+                game.finish()
+            except BaseException:
+                pass
         sys.stdout.flush()
         sys.stderr.flush()
     return "ok"
@@ -123,6 +178,8 @@ async function init(buffers) {
   ctrl = buffers.ctrl ?? null;
   data = buffers.data ?? null;
   interrupt = buffers.interrupt ?? null;
+  eventLen = buffers.eventLen ?? null;
+  eventData = buffers.eventData ?? null;
 
   // Loaded at runtime from /pyodide/ (public dir) rather than bundled, so the
   // 9 MB wasm stays a separate, cacheable asset.
@@ -138,6 +195,7 @@ async function init(buffers) {
   pyodide.setStdout(makeWriter('stdout'));
   pyodide.setStderr(makeWriter('stderr'));
   if (interrupt) pyodide.setInterruptBuffer(interrupt);
+  pyodide.registerJsModule('_pyweb_bridge', pygameBridge);
 
   pyodide.runPython(DRIVER);
   post({ type: 'ready', version: pyodide.version });
@@ -147,8 +205,10 @@ async function run(code) {
   interruptedAtPrompt = false;
   if (interrupt) interrupt[0] = 0;
 
-  const runner = pyodide.globals.get('__pyweb_run');
+  let runner = null;
   try {
+    await ensurePygame(code);
+    runner = pyodide.globals.get('__pyweb_run');
     // The driver reports its own outcome and prints its own traceback, so the
     // only errors reaching this catch are interpreter-level failures.
     const status = await runner(code);
@@ -157,7 +217,7 @@ async function run(code) {
     post({ type: 'output', stream: 'stderr', text: `${err?.message ?? err}\n` });
     post({ type: 'done', status: 'error' });
   } finally {
-    runner.destroy();
+    runner?.destroy();
     if (interrupt) interrupt[0] = 0;
   }
 }

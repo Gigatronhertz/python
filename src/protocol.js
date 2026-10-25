@@ -19,6 +19,14 @@ export const STATE_INTERRUPT = 3; // user hit Stop / Ctrl+C while at the prompt
 
 export const DATA_BYTES = 1 << 16; // 64 KiB max per input line
 
+// Keyboard and mouse events for pygame travel the other way, main -> worker,
+// through a second single-slot mailbox: the main thread writes a JSON batch
+// into eventData and stores its length; the worker takes it and stores 0.
+// The main thread only writes while the slot is empty, so neither side ever
+// reads a half-written batch, and a game loop that never yields still sees
+// its input.
+export const EVENT_BYTES = 1 << 16;
+
 // Values Python's signal machinery understands via the interrupt buffer.
 export const SIGINT = 2;
 
@@ -27,6 +35,8 @@ export function createBuffers() {
     ctrl: new Int32Array(new SharedArrayBuffer(CTRL_LENGTH * 4)),
     data: new Uint8Array(new SharedArrayBuffer(DATA_BYTES)),
     interrupt: new Uint8Array(new SharedArrayBuffer(1)),
+    eventLen: new Int32Array(new SharedArrayBuffer(4)),
+    eventData: new Uint8Array(new SharedArrayBuffer(EVENT_BYTES)),
   };
 }
 

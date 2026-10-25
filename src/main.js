@@ -8,7 +8,7 @@ import {
   createBuffers, sharedMemoryAvailable,
   IDX_STATE, IDX_LEN, IDX_COLS, IDX_ROWS,
   STATE_READY, STATE_EOF, STATE_INTERRUPT,
-  DATA_BYTES, SIGINT,
+  DATA_BYTES, EVENT_BYTES, SIGINT,
 } from './protocol.js';
 
 const $ = (id) => document.getElementById(id);
@@ -27,6 +27,10 @@ const els = {
   warning: $('warning'),
   splitter: $('splitter'),
   panes: $('panes'),
+  screen: $('screen'),
+  screenTitle: $('screen-title'),
+  screenClose: $('screen-close'),
+  canvas: $('canvas'),
 };
 
 const STORAGE_KEY = 'pyweb:code';
@@ -98,6 +102,8 @@ function spawnWorker() {
     ctrl: state.buffers?.ctrl,
     data: state.buffers?.data,
     interrupt: state.buffers?.interrupt,
+    eventLen: state.buffers?.eventLen,
+    eventData: state.buffers?.eventData,
   });
   return worker;
 }
@@ -117,6 +123,18 @@ function handleWorkerMessage(msg) {
       con.write(msg.stream === 'stderr' ? `\x1b[31m${text}\x1b[0m` : text);
       break;
     }
+
+    case 'notice':
+      con.info(msg.text);
+      break;
+
+    case 'frame':
+      drawFrame(msg);
+      break;
+
+    case 'pygame':
+      handleGameMessage(msg);
+      break;
 
     case 'stdin-request':
       promptForInput();
@@ -180,6 +198,101 @@ async function promptForInput() {
   Atomics.notify(ctrl, IDX_STATE);
 }
 
+// ------------------------------------------------------------- pygame window
+
+// pygame runs in the worker against an in-memory screen (src/pygame_shim.py).
+// Frames arrive here as RGBA pixels; keyboard and mouse events go back as
+// JSON batches through the shared event mailbox (see protocol.js).
+
+const game = {
+  ctx: els.canvas.getContext('2d'),
+  pending: [],
+  flushScheduled: false,
+};
+
+function showScreen(show) {
+  if (els.screen.hidden !== show) return;
+  els.screen.hidden = !show;
+  con.refit();
+  publishTerminalSize();
+}
+
+function handleGameMessage(msg) {
+  if (msg.kind === 'open') {
+    els.canvas.width = msg.width;
+    els.canvas.height = msg.height;
+    game.ctx.fillStyle = '#000';
+    game.ctx.fillRect(0, 0, msg.width, msg.height);
+    els.screenTitle.textContent = msg.title;
+    els.canvas.style.cursor = '';
+    showScreen(true);
+    els.canvas.focus();
+  } else if (msg.kind === 'caption') {
+    els.screenTitle.textContent = msg.title;
+  } else if (msg.kind === 'cursor') {
+    els.canvas.style.cursor = msg.visible ? '' : 'none';
+  }
+}
+
+function drawFrame({ width, height, pixels }) {
+  if (els.canvas.width !== width || els.canvas.height !== height) {
+    els.canvas.width = width;
+    els.canvas.height = height;
+  }
+  game.ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+}
+
+/** Hand queued events to the worker once it has taken the previous batch. */
+function flushGameEvents() {
+  game.flushScheduled = false;
+  if (!state.buffers || !game.pending.length) return;
+  const { eventLen, eventData } = state.buffers;
+  if (Atomics.load(eventLen, 0) !== 0) {
+    // The game hasn't pumped its events yet; try again next frame.
+    scheduleFlush();
+    return;
+  }
+  let bytes = encoder.encode(JSON.stringify(game.pending));
+  if (bytes.length > EVENT_BYTES) bytes = encoder.encode(JSON.stringify(game.pending.slice(-200)));
+  game.pending = [];
+  eventData.set(bytes);
+  Atomics.store(eventLen, 0, bytes.length);
+}
+
+function scheduleFlush() {
+  if (game.flushScheduled) return;
+  game.flushScheduled = true;
+  requestAnimationFrame(flushGameEvents);
+}
+
+function queueGameEvent(ev) {
+  if (!state.running || els.screen.hidden) return;
+  const last = game.pending[game.pending.length - 1];
+  // Coalesce mouse motion; the game only needs where the pointer ended up.
+  if (ev.t === 'mm' && last?.t === 'mm') game.pending[game.pending.length - 1] = ev;
+  else game.pending.push(ev);
+  flushGameEvents();
+}
+
+/** Page coordinates -> pygame surface pixels, undoing object-fit: contain. */
+function canvasPoint(ev) {
+  const rect = els.canvas.getBoundingClientRect();
+  const { width, height } = els.canvas;
+  const scale = Math.min(rect.width / width, rect.height / height);
+  const x = (ev.clientX - rect.left - (rect.width - width * scale) / 2) / scale;
+  const y = (ev.clientY - rect.top - (rect.height - height * scale) / 2) / scale;
+  return {
+    x: Math.max(0, Math.min(width - 1, Math.floor(x))),
+    y: Math.max(0, Math.min(height - 1, Math.floor(y))),
+  };
+}
+
+function resetGame() {
+  game.pending = [];
+  if (state.buffers) Atomics.store(state.buffers.eventLen, 0, 0);
+  showScreen(false);
+}
+
 // ------------------------------------------------------------------- commands
 
 function run() {
@@ -190,6 +303,7 @@ function run() {
   state.decoder = new TextDecoder('utf-8');
   publishTerminalSize();
   if (state.buffers) state.buffers.interrupt[0] = 0;
+  resetGame();
   setRunning(true);
   state.worker.postMessage({ type: 'run', code: editor.getCode() });
 }
@@ -238,6 +352,34 @@ els.run.addEventListener('click', run);
 els.stop.addEventListener('click', stop);
 els.clear.addEventListener('click', clearTerminal);
 con.onInterrupt = () => stop();
+
+els.canvas.addEventListener('keydown', (ev) => {
+  // Leave browser and app shortcuts (Ctrl+Enter, Ctrl+R, …) alone.
+  if (ev.ctrlKey || ev.metaKey) return;
+  ev.preventDefault();
+  queueGameEvent({ t: 'kd', code: ev.code, key: ev.key, rep: ev.repeat });
+});
+els.canvas.addEventListener('keyup', (ev) => {
+  ev.preventDefault();
+  queueGameEvent({ t: 'ku', code: ev.code, key: ev.key });
+});
+els.canvas.addEventListener('pointermove', (ev) => queueGameEvent({ t: 'mm', ...canvasPoint(ev) }));
+els.canvas.addEventListener('pointerdown', (ev) => {
+  els.canvas.focus();
+  els.canvas.setPointerCapture(ev.pointerId);
+  queueGameEvent({ t: 'md', b: ev.button, ...canvasPoint(ev) });
+});
+els.canvas.addEventListener('pointerup', (ev) => queueGameEvent({ t: 'mu', b: ev.button, ...canvasPoint(ev) }));
+els.canvas.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  queueGameEvent({ t: 'wh', dx: ev.deltaX, dy: ev.deltaY });
+}, { passive: false });
+els.canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
+els.canvas.addEventListener('blur', () => queueGameEvent({ t: 'blur' }));
+els.screenClose.addEventListener('click', () => {
+  if (state.running) queueGameEvent({ t: 'quit' });
+  else showScreen(false);
+});
 
 for (const ex of EXAMPLES) {
   const opt = document.createElement('option');
